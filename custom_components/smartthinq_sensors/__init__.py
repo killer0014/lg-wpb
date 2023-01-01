@@ -64,7 +64,6 @@ SMARTTHINQ_PLATFORMS = [
     Platform.BINARY_SENSOR,
     Platform.CLIMATE,
     Platform.FAN,
-    Platform.HUMIDIFIER,
     Platform.SENSOR,
     Platform.SWITCH,
     Platform.WATER_HEATER,

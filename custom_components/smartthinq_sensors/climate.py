@@ -8,6 +8,8 @@ from typing import Any, Awaitable, Callable, Tuple
 from homeassistant.components.climate import ClimateEntity, ClimateEntityDescription
 from homeassistant.components.climate.const import (
     ATTR_HVAC_MODE,
+    DEFAULT_MAX_HUMIDITY,
+    DEFAULT_MIN_HUMIDITY,
     DEFAULT_MAX_TEMP,
     DEFAULT_MIN_TEMP,
     PRESET_ECO,
@@ -28,17 +30,19 @@ from .device_helpers import TEMP_UNIT_LOOKUP, LGERefrigeratorDevice, get_entity_
 from .wideq import (
     FEAT_HUMIDITY,
     FEAT_ROOM_TEMP,
+    FEAT_TARGET_HUMIDITY,
     FEAT_WATER_OUT_TEMP,
     UNIT_TEMP_FAHRENHEIT,
     DeviceType,
 )
 from .wideq.devices.ac import AWHP_MAX_TEMP, AWHP_MIN_TEMP, ACMode, AirConditionerDevice
+from .wideq.devices.dehumidifier import DeHumidifierDevice
 
 # general ac attributes
 ATTR_FRIDGE = "fridge"
 ATTR_FREEZER = "freezer"
 
-HVAC_MODE_LOOKUP: dict[str, HVACMode] = {
+AC_HVAC_MODE_LOOKUP: dict[str, HVACMode] = {
     ACMode.AI.name: HVACMode.AUTO,
     ACMode.HEAT.name: HVACMode.HEAT,
     ACMode.DRY.name: HVACMode.DRY,
@@ -47,7 +51,7 @@ HVAC_MODE_LOOKUP: dict[str, HVACMode] = {
     ACMode.ACO.name: HVACMode.HEAT_COOL,
 }
 
-PRESET_MODE_LOOKUP: dict[str, dict[str, HVACMode]] = {
+AC_PRESET_MODE_LOOKUP: dict[str, dict[str, HVACMode]] = {
     ACMode.ENERGY_SAVING.name: {"preset": PRESET_ECO, "hvac": HVACMode.COOL},
     ACMode.ENERGY_SAVER.name: {"preset": PRESET_ECO, "hvac": HVACMode.COOL},
 }
@@ -128,6 +132,14 @@ async def async_setup_entry(
             ]
         )
 
+        # DeHumidifier devices
+        lge_climates.extend(
+            [
+                LGEDeHumidifier(lge_device)
+                for lge_device in lge_devices.get(DeviceType.DEHUMIDIFIER, [])
+            ]
+        )
+
         # Refrigerator devices
         lge_climates.extend(
             [
@@ -170,11 +182,13 @@ class LGEACClimate(LGEClimate):
         self._device: AirConditionerDevice = api.device
         self._attr_name = api.name
         self._attr_unique_id = f"{api.unique_id}-AC"
+
         self._attr_fan_modes = self._device.fan_speeds
         self._attr_swing_modes = [
             f"{SWING_PREFIX[0]}{mode}" for mode in self._device.vertical_step_modes
         ] + [f"{SWING_PREFIX[1]}{mode}" for mode in self._device.horizontal_step_modes]
         self._attr_preset_mode = None
+        self._attr_supported_features = None
 
         self._hvac_mode_lookup: dict[str, HVACMode] | None = None
         self._preset_mode_lookup: dict[str, str] | None = None
@@ -187,7 +201,7 @@ class LGEACClimate(LGEClimate):
         if self._hvac_mode_lookup is None:
             self._hvac_mode_lookup = {
                 key: mode
-                for key, mode in HVAC_MODE_LOOKUP.items()
+                for key, mode in AC_HVAC_MODE_LOOKUP.items()
                 if key in self._device.op_modes
             }
         return self._hvac_mode_lookup
@@ -197,7 +211,7 @@ class LGEACClimate(LGEClimate):
         if self._preset_mode_lookup is None:
             hvac_modes = list(self._available_hvac_modes().values())
             modes = {}
-            for key, mode in PRESET_MODE_LOOKUP.items():
+            for key, mode in AC_PRESET_MODE_LOOKUP.items():
                 if key not in self._device.op_modes:
                     continue
                 # skip preset mode with invalid hvac mode associated
@@ -223,6 +237,9 @@ class LGEACClimate(LGEClimate):
     @property
     def supported_features(self) -> int:
         """Return the list of supported features."""
+        if self._attr_supported_features is not None:
+            return self._attr_supported_features
+
         features = ClimateEntityFeature.TARGET_TEMPERATURE
         if len(self.fan_modes) > 0:
             features |= ClimateEntityFeature.FAN_MODE
@@ -230,6 +247,7 @@ class LGEACClimate(LGEClimate):
             features |= ClimateEntityFeature.PRESET_MODE
         if self._support_ver_swing or self._support_hor_swing:
             features |= ClimateEntityFeature.SWING_MODE
+        self._attr_supported_features = features
         return features
 
     @property
@@ -266,7 +284,7 @@ class LGEACClimate(LGEClimate):
         presets = self._available_preset_modes()
         if op_mode in presets:
             self._attr_preset_mode = presets[op_mode]
-            return PRESET_MODE_LOOKUP[op_mode]["hvac"]
+            return AC_PRESET_MODE_LOOKUP[op_mode]["hvac"]
         if self._attr_preset_mode:
             self._attr_preset_mode = PRESET_NONE
         modes = self._available_hvac_modes()
@@ -305,7 +323,7 @@ class LGEACClimate(LGEClimate):
             curr_preset = self._attr_preset_mode
             if curr_preset != PRESET_NONE and self._api.state.is_on:
                 op_mode = reverse_lookup[curr_preset]
-                await self.async_set_hvac_mode(PRESET_MODE_LOOKUP[op_mode]["hvac"])
+                await self.async_set_hvac_mode(AC_PRESET_MODE_LOOKUP[op_mode]["hvac"])
             return
 
         if (operation_mode := reverse_lookup.get(preset_mode)) is None:
@@ -424,6 +442,138 @@ class LGEACClimate(LGEClimate):
         return self._device.conv_temp_unit(
             AWHP_MAX_TEMP if self._device.is_air_to_water else DEFAULT_MAX_TEMP
         )
+
+
+class LGEDeHumidifier(LGEClimate):
+    """LG DeHumidifier device."""
+
+    def __init__(self, api: LGEDevice) -> None:
+        """Initialize the dehumidifier."""
+        super().__init__(api)
+        self._device: DeHumidifierDevice = api.device
+        self._attr_name = api.name
+        self._attr_unique_id = f"{api.unique_id}-AC"
+
+        # always required by climate entity
+        self._attr_temperature_unit = UnitOfTemperature.CELSIUS
+        self._attr_min_temp = None
+        self._attr_max_temp = None
+        self._attr_hvac_modes = [HVACMode.OFF, HVACMode.DRY]
+
+        if len(self._device.op_modes) > 1:
+            self._attr_preset_modes = self._device.op_modes
+        else:
+            self._attr_preset_modes = None
+        self._attr_preset_mode = None
+        if len(self._device.fan_speeds) > 1:
+            self._attr_fan_modes = self._device.fan_speeds
+        else:
+            self._attr_fan_modes = None
+        self._attr_fan_mode = None
+        self._attr_supported_features = None
+
+    @property
+    def supported_features(self) -> int:
+        """Return the list of supported features."""
+        if self._attr_supported_features is not None:
+            return self._attr_supported_features
+
+        features = 0
+        if self.target_humidity:
+            features |= ClimateEntityFeature.TARGET_HUMIDITY
+        if self.preset_modes:
+            features |= ClimateEntityFeature.PRESET_MODE
+        if self.fan_modes:
+            features |= ClimateEntityFeature.FAN_MODE
+        self._attr_supported_features = features
+        return features
+
+    @property
+    def hvac_mode(self) -> HVACMode | str | None:
+        """Return hvac operation ie. heat, cool mode."""
+        if self._api.state.is_on:
+            if self.preset_modes:
+                self._attr_preset_mode = self._api.state.operation_mode
+            if self.fan_modes:
+                self._attr_fan_mode = self._api.state.fan_speed
+            return HVACMode.DRY
+
+        self._attr_preset_mode = None
+        self._attr_fan_mode = None
+        return HVACMode.OFF
+
+    @property
+    def current_humidity(self) -> int | None:
+        return self._api.state.device_features.get(FEAT_HUMIDITY)
+
+    @property
+    def target_humidity(self) -> int | None:
+        """Return the humidity we try to reach."""
+        return self._api.state.device_features.get(FEAT_TARGET_HUMIDITY)
+
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        """Set new target hvac mode."""
+        if hvac_mode not in self.hvac_modes:
+            raise ValueError(f"Invalid hvac_mode [{hvac_mode}]")
+        await self._device.power(hvac_mode != HVACMode.OFF)
+        self._api.async_set_updated()
+
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        """Set new preset mode."""
+        if not preset_mode:
+            return
+        if not self.preset_modes:
+            raise NotImplementedError()
+        if preset_mode not in self.preset_modes:
+            raise ValueError(f"Invalid preset mode [{preset_mode}]")
+        if not self._api.state.is_on:
+            await self._device.power(True)
+        await self._device.set_op_mode(preset_mode)
+        self._api.async_set_updated()
+
+    async def async_set_fan_mode(self, fan_mode: str) -> None:
+        """Set new fan mode."""
+        if not fan_mode:
+            return
+        if not self.fan_modes:
+            raise NotImplementedError()
+        if fan_mode not in self.fan_modes:
+            raise ValueError(f"Invalid fan mode [{fan_mode}]")
+        if not self._api.state.is_on:
+            await self._device.power(True)
+        await self._device.set_fan_speed(fan_mode)
+        self._api.async_set_updated()
+
+    async def async_set_humidity(self, humidity: int) -> None:
+        """Set new target humidity."""
+        humidity_step = self._device.target_humidity_step or 1
+        target_humidity = humidity + (humidity % humidity_step)
+        await self._device.set_target_humidity(target_humidity)
+        self._api.async_set_updated()
+
+    async def async_turn_on(self, **kwargs) -> None:
+        """Turn the entity on."""
+        await self._device.power(True)
+        self._api.async_set_updated()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        """Turn the entity off."""
+        await self._device.power(False)
+        self._api.async_set_updated()
+
+    @property
+    def min_humidity(self) -> int:
+        """Return the minimum humidity."""
+        if (min_value := self._device.target_humidity_min) is not None:
+            return min_value
+        return DEFAULT_MIN_HUMIDITY
+
+    @property
+    def max_humidity(self) -> int:
+        """Return the maximum humidity."""
+        if (max_value := self._device.target_humidity_max) is not None:
+            return max_value
+        return DEFAULT_MAX_HUMIDITY
 
 
 class LGERefrigeratorClimate(LGEClimate):
